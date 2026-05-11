@@ -1,0 +1,416 @@
+  내가 만든 첫 lock-free ring buffer는 lock-free가 아니었다
+
+  들어가며
+
+  암호화폐 거래소를 상대로 자동매매 봇을 만들고 있다. "마켓메이커(market maker)"라는 종류로, 호가창에 매수와 매도 주문을 동시에 깔아두고 그 차이를 수익으로 가져가는 전략이다.
+  
+  이런 봇이 잘 돌아가려면 두 가지가 거의 동시에 일어나야 한다.
+  
+  1. 거래소가 보내주는 시장 데이터(호가 변동)를 받아서 분석한다.
+  2. 분석 결과로 주문을 만들어 거래소로 보낸다.
+
+  문제는 둘 다 매우 빠르게 일어난다는 것이다. 호가는 1초에 수백 번 바뀌고, 그때마다 우리 주문도 바뀌어야 한다. 늦으면 시장이 우리를 일방적으로 체결시켜서(adverse selection이라 부른다) 손실이 난다.
+  
+  그래서 시스템을 여러 프로세스로 쪼개기로 했다.
+  
+  - 데이터 수집 프로세스: WebSocket으로 호가를 받는다.
+  - 전략 프로세스: 받은 데이터로 주문을 결정한다.
+  - 주문 송신 프로세스: 결정된 주문을 거래소로 보낸다.
+  
+  각자 자기 일에만 집중하면 더 빠르고, 한 군데에 문제가 생겨도 다른 컴포넌트가 영향을 덜 받는다.
+  
+  그런데 이렇게 쪼개면 한 가지 문제가 생긴다. 서로 다른 프로세스끼리 어떻게 데이터를 주고받을 것인가?
+  
+  여기서 등장하는 게 ring buffer다.
+
+  ---
+  Ring buffer가 뭔지
+  
+  Ring buffer는 그냥 "원형으로 이어진 줄"이다. 한쪽 끝에서 생산자(producer)가 데이터를 넣고, 반대쪽 끝에서 소비자(consumer)가 데이터를 꺼낸다. 줄이 다 차면 새 데이터를 못 넣고, 비어 있으면 꺼낼 게 없다.
+
+  비유로 설명하자면 길이가 정해진 컨베이어 벨트다. 한쪽에 서 있는 사람이 박스를 벨트 위에 올린다. 반대편에 있는 사람이 박스를 꺼내서 처리한다. 끝까지 가면 다시 시작점으로 돌아온다. 원형.
+  
+  컨베이어 벨트 (capacity = 8)
+
+     ↓ 생산자가 박스 올림 (head)
+  ┌───┬───┬───┬───┬───┬───┬───┬───┐
+  │ ■ │ ■ │ ■ │ . │ . │ . │ . │ . │
+  └───┴───┴───┴───┴───┴───┴───┴───┘
+     ↑ 소비자가 박스 꺼냄 (tail)
+
+  여기서 두 사람은 박스를 직접 건네지 않는다. 박스의 위치만 보고 자기 일을 한다. 즉 "벨트 위에 어디까지 박스가 있느냐"만 합의되면 된다. 이 합의가 두 개의 숫자, head(생산자가 다음에 넣을 자리)와 tail(소비자가 다음에 꺼낼 자리)이다.
+  
+  이게 우리가 필요한 정확한 그림이다. 데이터 수집 프로세스가 시장 데이터를 박스에 담아 올리고, 전략 프로세스가 반대편에서 꺼낸다.
+  
+  문제는 두 프로세스가 서로 다른 메모리 공간에 산다는 것. 운영체제는 보통 한 프로세스가 다른 프로세스의 메모리를 못 만지게 막는다. 그래서 둘이 공유할 수 있는 특별한 메모리 영역이 필요하다. 이걸 공유 메모리(Shared Memory, SHM) 라고 한다. 리눅스와
+  macOS에는 SHM을 만드는 시스템 콜이 있고, Python은 multiprocessing.shared_memory 모듈로 이걸 감싸서 제공한다.
+
+  종합하면, 우리가 만들고 싶은 건 SHM 위에 올라간 원형 줄 — 그리고 두 프로세스가 락(lock) 없이 안전하게 데이터를 주고받을 수 있는 구조다.
+  
+  ---
+  "Lock-free"라는 단어 자체에 대하여
+
+  여기서 "lock"이란 단어를 잠깐 짚고 가자.
+
+  여러 프로세스(혹은 스레드)가 같은 데이터를 동시에 만지면 충돌이 난다. 한 명이 쓰는 중에 다른 명이 그걸 읽으면, 절반은 옛 값이고 절반은 새 값인 이상한 데이터가 보일 수 있다. 이걸 race condition이라 부른다.
+  
+  전통적인 해결책은 lock이다. "이 데이터 만질 때는 한 번에 한 명만"이라는 룰을 정해두고, 한 명이 만지는 동안 다른 명은 줄을 서서 기다린다.
+  
+  그런데 lock은 비싸다. lock을 잡는 데 100나노초~1마이크로초가 걸리고, 누가 잡고 있으면 나머지 모두가 멈춘다. 우리처럼 마이크로초 단위로 반응해야 하는 시스템에서는 lock을 최대한 피하고 싶다.
+  
+  Lock-free 알고리즘은 lock을 안 쓰면서도 race condition을 피하는 방법이다. 어떻게? 데이터 자체가 "원자적(atomic)"이 되도록 만든다.
+  
+  "원자적"이라는 건 "쪼개지지 않는다"는 뜻이다. 한 변수를 쓰는 작업이 중간에 끼어들 수 없게 하드웨어 수준에서 보장되는 것. 현대 CPU는 8바이트 정수 같은 작은 값을 정렬만 잘 맞춰져 있으면 한 번에 통째로 읽고 쓰는 명령어를 제공한다. 이걸 잘 이용하면 lock
+  없이도 안전한 자료구조를 만들 수 있다.
+
+  특히 SPSC ring buffer(Single Producer, Single Consumer — 생산자 한 명, 소비자 한 명)는 lock-free로 만드는 게 비교적 쉽다. 생산자는 head만 만지고, 소비자는 tail만 만지니까 둘이 충돌할 일이 거의 없다.
+  
+  키워드는 "비교적 쉽다"다. "쉽다"가 아니다.
+  
+  ---
+  첫 시도: ShmRing.py
+  
+  처음 만든 버전은 이렇게 생겼다. 순수 Python으로, multiprocessing.shared_memory로 메모리 한 덩어리 잡고, head/tail을 헤더에 두고, 데이터를 그 뒤에 깔았다.
+
+  공유 메모리 레이아웃:
+  ┌─────────┬─────────┬──────────────────────────────┐
+  │  head   │  tail   │       데이터 영역             │
+  │ (8byte) │ (8byte) │   item × capacity            │
+  └─────────┴─────────┴──────────────────────────────┘
+     ↑           ↑
+     생산자      소비자
+     여기 갱신   여기 갱신
+
+  핵심 코드는 대략 이렇다.
+  
+  class ShmRing:
+      def push(self, rec):
+          head, tail = self._get_head_tail()    # struct.unpack_from으로 읽기
+          nxt = (head + 1) % self.capacity
+          if nxt == tail:
+              return False                      # 가득 참
+          self.arr[head] = rec                   # 데이터 기록
+          self._set_head(nxt)                    # struct.pack_into로 head 갱신
+          return True
+
+      def pop_many(self, maxn):
+          head, tail = self._get_head_tail()
+          if head == tail:
+              return None                       # 비어 있음
+          n = min(maxn, ...)
+          out = self.arr[tail:tail+n].copy()
+          self._set_tail((tail + n) % self.capacity)
+          return out
+
+  _set_head는 내부적으로 struct.pack_into('<q', buf, 0, value) — "8바이트 정수를 buf의 0번 위치에 little-endian으로 써라" — 를 호출한다.
+  
+  이걸 실행하니 잘 돌아갔다. 두 프로세스가 서로 데이터를 주고받았고, 깨지거나 손실되는 일이 없어 보였다. 나는 이때 "오, 내가 lock-free ring buffer를 만들었구나" 라고 생각했다.
+  
+  그런데 사실 이건 lock-free가 아니었다.
+
+  ---
+  깨달음: 이게 왜 lock-free가 아닌가
+  
+  이 코드가 "lock-free처럼 동작했던" 이유와, 그게 왜 "정말로 lock-free인 것"과 다른지를 다섯 가지 함정으로 풀어보자.
+
+  함정 1: struct.pack_into는 atomic을 보장하지 않는다
+
+  self._set_head(nxt)   # 내부: struct.pack_into('<q', buf, 0, nxt)
+
+  이 한 줄이 메모리에 한 번에 쓰여진다는 보장이 어디에도 없다. CPython 내부 구현은:
+  
+  1. nxt를 Python int 객체에서 C long long으로 변환
+  2. struct 모듈이 endianness 처리
+  3. C 측에서 메모리에 복사
+  
+  이 과정이 어디서 중단되거나, 부분적으로만 보이거나 하지 않을지 명확한 보장이 없다.
+  
+  CPU 수준에서는 8바이트 정렬된 int64를 한 번에 쓰는 단일 MOV 명령어가 존재한다. 그래서 운 좋게 잘 동작했을 가능성이 크다. x86-64에서 정렬된 int64 load/store는 hardware-atomic이다. 하지만 그건 운이지 보장이 아니다.
+  
+  함정 2: GIL은 cross-process를 보호하지 못한다
+  
+  Python의 GIL(Global Interpreter Lock)은 한 인터프리터 안의 여러 스레드가 동시에 Python 객체를 만지지 못하게 막는다. 즉 한 프로세스 안 멀티스레드에서는 race condition이 어느 정도 보호된다.
+  
+  하지만 별개의 프로세스는 각자 자기 GIL을 가진다. 데이터 수집 프로세스의 GIL과 전략 프로세스의 GIL은 서로 모르는 사이다. SHM에서 둘이 같은 메모리를 만질 때, GIL은 아무것도 보호하지 않는다.
+  
+  이게 사실 가장 큰 깨달음이었다. "Python에서 lock-free 자료구조 만들었어요"라고 말하는 많은 코드가 사실 GIL에 의존하고 있다. 같은 프로세스 안 멀티스레드용으론 작동하지만, multiprocessing으로 가면 보장이 깨진다.
+  
+  함정 3: 메모리 순서(memory ordering)
+  
+  이건 좀 어렵지만 중요하다.
+
+  생산자 코드:
+  1. self.arr[head] = rec        # 데이터 쓰기
+  2. self._set_head(nxt)         # head 갱신
+  
+  직관적으로는 1번이 먼저 메모리에 반영되고 그 다음 2번이 반영된다. 그런데 컴퓨터는 그렇게 동작 안 한다.
+
+  - 컴파일러는 최적화하면서 명령어 순서를 바꿀 수 있다.
+  - CPU는 명령어를 out-of-order로 실행하고, 메모리 쓰기를 자기 캐시에 모았다가 한 번에 내려보낸다.
+  - 캐시 시스템은 코어마다 다른 시점에 동기화한다.
+  
+  결과적으로 다른 CPU 코어에서 봤을 때 2번이 먼저 보이고 1번이 나중에 보일 수도 있다. 즉 "head는 새 값이 됐는데 데이터 영역은 아직 옛 값"인 순간이 있을 수 있다.
+  
+  소비자가 그 찰나에 데이터를 꺼내면 쓰레기 값을 읽는다. 가끔, 매우 드물게, 디버깅 불가능한 형태로.
+  
+  x86-64는 "TSO(Total Store Order)"라는 비교적 강한 메모리 모델을 채택한다. 쓰기들은 프로그램 순서대로 다른 코어에 보인다. 그래서 이 시나리오가 x86에서는 거의 안 일어난다. 하지만:
+  
+  - Python 코드 수준에서는 이게 어떤 메모리 명령어로 컴파일되는지 통제할 수 없다.
+  - 컴파일러 reorder는 막을 수 없다.
+  - ARM이나 다른 약한 메모리 모델 아키텍처로 가면 깨진다.
+
+  함정 4: 정렬(alignment) 보장이 없다
+
+  CPU가 int64를 atomic하게 읽고 쓰려면 그 메모리 주소가 8바이트 정렬돼야 한다(주소 ÷ 8 나머지가 0).
+  
+  Python의 bytes, bytearray, memoryview 모두 정렬에 대해 아무것도 보장하지 않는다. multiprocessing.shared_memory.SharedMemory.buf도 마찬가지. 운 좋게 0번 오프셋이 정렬돼 있을 수는 있지만, "보장"은 아니다.
+  
+  정렬이 어긋난 int64 쓰기는 두 개의 작은 쓰기로 쪼개진다. 그 사이에 다른 코어가 읽으면 — 또 쓰레기 값.
+  
+  함정 5: Python 인터프리터 자체의 비용
+
+  race condition은 인지 못 했어도 성능에 의문은 들었다. 측정해보니 push 한 번에 약 5,000~10,000 나노초 (= 5~10마이크로초)가 걸렸다.
+  
+  1초에 10만 번 push하면 push에만 0.5~1초가 사라진다는 뜻이다. 1코어가 그 시간을 ring 갱신에만 쓰는 격.
+  
+  분석해보니 대부분의 시간은 Python 자체였다.
+  
+  - struct.unpack_from 호출 — Python 함수 호출 오버헤드
+  - 산술 연산 — Python int 객체 만들고 부수기
+  - numpy slice 할당 — numpy 측 Python wrapper 통과
+  - struct.pack_into 호출 — 또 Python 함수 호출
+  
+  전부 인터프리터를 통과한다. 한 줄짜리 같은 코드도 실제로는 수십 개의 인터프리터 명령으로 풀린다.
+  
+  정리
+
+  ┌───────────────────────────────────┬──────────────────────────────────────┬────────────────────────────────────────┐
+  │               함정                │             무엇이 문제              │           x86에서 실제 영향            │
+  ├───────────────────────────────────┼──────────────────────────────────────┼────────────────────────────────────────┤
+  │ 1. struct.pack_into atomic 미보장 │ 8바이트 쓰기가 쪼개질 수 있음        │ 운 좋으면 단일 MOV로 컴파일돼 안전     │
+  ├───────────────────────────────────┼──────────────────────────────────────┼────────────────────────────────────────┤
+  │ 2. GIL이 cross-process 보호 못함  │ 다른 프로세스의 메모리 접근 GIL 무관 │ SPSC라 충돌 자체가 드물어 표면화 안 됨 │
+  ├───────────────────────────────────┼──────────────────────────────────────┼────────────────────────────────────────┤
+  │ 3. Memory ordering 보장 없음      │ head가 데이터보다 먼저 보일 수 있음  │ x86 TSO가 가려줌 (하지만 보장 아님)    │
+  ├───────────────────────────────────┼──────────────────────────────────────┼────────────────────────────────────────┤
+  │ 4. 정렬 미보장                    │ int64 쓰기 쪼개질 수 있음            │ offset 0이 우연히 정렬돼 안전          │
+  ├───────────────────────────────────┼──────────────────────────────────────┼────────────────────────────────────────┤
+  │ 5. Python 인터프리터 비용         │ push당 ~5-10µs                       │ 실측으로 확인됨                        │
+  └───────────────────────────────────┴──────────────────────────────────────┴────────────────────────────────────────┘
+  
+  즉 "x86 + 같은 CPython + 단일 머신 + 운 좋으면" 작동했다. 그뿐이다.
+  
+  이걸 진짜 lock-free로 만들려면 무엇이 필요한가?
+
+  ---
+  진짜 lock-free에 필요한 것들
+  
+  1. Atomic load/store — head/tail 갱신이 진짜로 원자적이어야 한다.
+  2. Memory ordering 통제 — 데이터 쓰기와 head 갱신의 관찰 순서가 보장돼야 한다.
+  3. 메모리 정렬 — head/tail이 8바이트 정렬에 들어가야 한다.
+  4. 컴파일러 reorder 방지 — 컴파일러가 명령어 순서를 못 바꾸게 명시해야 한다.
+  5. 빠른 hot path — Python interpreter를 안 거치는 C-level 코드.
+  
+  Python 단독으로는 이 다섯 개를 다 만족시킬 방법이 없다. 그래서 Cython으로 옮기기로 했다.
+  
+  Cython은 Python 같은 문법으로 코드를 쓰면 C로 컴파일해주는 도구다. C 타입(int64_t, char*), C 라이브러리(memcpy), volatile 키워드 같은 저수준 기능을 다 쓸 수 있다. Python 모듈처럼 import해서 쓸 수 있지만, hot path는 사실상 C 코드.
+  
+  ---
+  새 버전: lockfree_ring_cy.pyx
+
+  새 버전의 핵심 코드는 이렇다.
+
+  cdef class LockfreeSPSCRingCy:
+      # volatile = 컴파일러가 이 위치를 캐싱하거나 reorder하면 안 됨
+      cdef volatile int64_t* _head_ptr   # offset  0
+      cdef volatile int64_t* _tail_ptr   # offset  8
+      cdef volatile int64_t* _cap_ptr    # offset 16
+      cdef volatile int64_t* _seq_ptr    # offset 24
+      cdef char* _data_ptr               # offset 64 (헤더 다음)
+
+      cpdef bint push(self, np.ndarray rec):
+          cdef int64_t head = self._head_ptr[0]
+          cdef int64_t tail = self._tail_ptr[0]
+          cdef int64_t nxt = head + 1
+          if nxt >= self.capacity:
+              nxt = 0
+          if nxt == tail:
+              return False
+          cdef char* slot = self._data_ptr + head * self.item_size
+          memcpy(slot, np.PyArray_DATA(rec), self.item_size)
+          self._head_ptr[0] = nxt    # 데이터 먼저, 그 다음 head 갱신
+          return True
+
+  한 줄씩 무슨 일이 일어나는지 풀어보자.
+
+  volatile int64_t*
+
+  이게 핵심이다. volatile은 C 키워드로 "이 메모리 위치는 다른 누군가가 만질 수 있다" 고 컴파일러에 알린다. 그러면 컴파일러는:
+  
+  - 이 변수를 레지스터에 캐싱해서 재사용하지 않는다.
+  - 이 위치 주변의 명령어 순서를 함부로 바꾸지 않는다.
+  - 매번 진짜로 메모리에 다녀온다.
+  
+  cdef int64_t head = self._head_ptr[0]
+
+  이 한 줄은 컴파일 후 정확히 한 개의 MOV 명령어가 된다. 메모리에서 int64 한 개를 레지스터로 읽는 단일 명령. x86-64에서 이건 hardware-atomic이다. 8바이트 정렬만 보장되면 절대 쪼개지지 않는다.
+  
+  정렬 보장
+
+  self._head_ptr = <volatile int64_t*>base          # offset 0
+  self._tail_ptr = <volatile int64_t*>(base + 8)    # offset 8
+
+  shared_memory.SharedMemory가 할당하는 메모리의 시작 주소는 페이지 정렬(4KB)이다. 0번 오프셋은 자동으로 8바이트 정렬에 들어간다. offset 8, 16, 24도 마찬가지. 운에 안 맡기고 명시적으로 정렬을 보장한다.
+  
+  HEADER_SIZE = 64로 잡은 것도 의도가 있다. 64바이트는 CPU 캐시 라인 크기다. 헤더(head/tail/cap/seq, 총 32바이트)와 데이터 영역이 같은 캐시 라인에 안 걸치게 64로 패딩했다. 이걸 안 하면 "false sharing"이라는 문제가 생긴다 — 헤더와 데이터가 같은 캐시
+  라인에 있으면, 데이터 쓰기가 헤더 캐시도 무효화시켜서 다른 코어가 head를 다시 읽어야 한다. 성능 죽이는 일이다.
+
+  memcpy(slot, ...)
+  
+  데이터 복사는 libc의 memcpy()를 직접 호출한다. SIMD 같은 CPU 명령어로 최적화된 어셈블리 코드라 numpy slice 할당보다 훨씬 빠르다. 레코드 1개(보통 64~128바이트) 복사는 한두 개 캐시 라인 transfer로 끝나서 약 10나노초.
+  
+  메모리 순서
+
+  memcpy(slot, ...)         # ① 데이터 쓰기
+  self._head_ptr[0] = nxt   # ② head 갱신
+  
+  x86-64 TSO는 "쓰기들은 프로그램 순서대로 다른 코어에 보인다"를 보장한다. 즉 다른 코어가 ②를 봤다면 ①도 반드시 봤다. 그래서 소비자가 head를 보고 데이터를 읽으면, 그 데이터는 무조건 새 데이터다. 함정 3 해결.
+  
+  (만약 ARM 같은 약한 메모리 모델로 가면, ② 전에 명시적인 release barrier가 필요하다. 이 코드는 x86-64 전용이라고 docstring에 명시해뒀다.)
+  
+  cpdef bint
+
+  cpdef는 "Python에서도 호출 가능하지만 C-level 빠른 경로도 가진 함수"라는 뜻. Cython 내부에서 호출할 때는 직접 C 함수 호출로 inline된다. bint는 "C boolean", int64_t는 C 정수다. Python 인터프리터를 안 거친다. 함정 5 해결.
+  
+  측정 결과
+
+  첫 번째 버전 (Python): push 1회 약 5,000~10,000 나노초
+  새 버전     (Cython):  push 1회 약   100~  200 나노초
+  
+  30~50배 빨라졌다. 그리고 이전엔 "운 좋으면 안전"이었던 것이 이제 "x86-64 + SPSC라는 명시된 조건 하에서 보장된 안전"이 됐다.
+  
+  ---
+  부수적으로 발견한 footgun들
+  
+  다시 짜는 김에 첫 버전에 숨어있던 다른 함정도 잡았다. 이건 더 production-y한 문제들이다.
+
+  Footgun 1: 자동 SHM 삭제
+  
+  Python의 multiprocessing.shared_memory.SharedMemory는 잘 알려지지 않은 함정이 있다. 생성한 프로세스가 종료되면, resource_tracker라는 백그라운드 프로세스가 자동으로 그 SHM을 shm_unlink() 한다. 즉 메모리가 사라진다.
+  
+  우리 시나리오에서는 이게 치명적이다. 주문 송신 프로세스가 SHM ring을 만들고, 데이터 수집 프로세스와 전략 프로세스가 거기 attached 돼 있다. 주문 송신 프로세스를 재시작하면? 모든 다른 프로세스의 SHM mapping이 깨진다. 멀쩡히 돌고 있던 워커들이 어느 순간
+  segfault나 silent corruption.
+
+  이건 Python <3.13에서 알려진 동작이다(bpo-38119 참고). 해결책은 명시적으로 resource_tracker에서 unregister하는 것:
+  
+  def _rt_unregister(shm_name):
+      from multiprocessing import resource_tracker
+      resource_tracker.unregister(shm_name, "shared_memory")
+
+  이걸 호출하면 SHM이 프로세스 생애주기와 독립적으로 존재한다. 누가 명시적으로 shm_unlink() 하거나 rm /dev/shm/RING_* 할 때까지 살아있다. 우리는 시스템 종료할 때 crazyctl stop 명령으로 한 번에 청소한다.
+  
+  이건 진짜 운영하면서 한 번 안 깨져봤으면 절대 모를 디테일이다.
+  
+  Footgun 2: capacity 검증 없음
+  
+  if capacity < 2:
+      raise ValueError(...)
+
+  capacity=1이면 어떻게 될까? (head + 1) % capacity == tail이 항상 성립한다(둘 다 0이니까). 즉 push가 영원히 False를 리턴한다. ring은 영원히 "가득 참" 상태.
+  
+  capacity=0이면? Modulo by zero로 죽는다.
+
+  원본은 이 검사가 없었다. 새 버전은 명시적으로 거부한다. 그리고 attached하는 쪽에서는 SHM 헤더에서 capacity를 읽어서 검증한다. 이전 버전의 stale segment에 잘못 attach되거나, 호환 안 되는 다른 코드가 만든 SHM에 attach되면 즉시 fail-fast.
+  
+  Footgun 3: 매번 allocation하는 pop API
+
+  원본 pop_many는 매번 새 numpy 배열을 할당한다.
+  
+  out = np.empty(n, dtype=self.item_dtype)
+
+  소비자가 1ms마다 polling하면 초당 1,000번 할당. 작은 numpy 배열 할당은 Python allocator + GC를 거치는데, 이게 의외로 비싸다. 그리고 GC pause는 hot path에서 가장 무서운 적이다 — 평소엔 빠르다가 어쩌다 한 번 100ms씩 멈춘다.
+  
+  새 버전은 pop_into API를 추가했다.
+
+  buf = np.empty(1, dtype=DTYPE)    # 호출자가 한 번만 할당
+  while ring.pop_into(buf):         # 0 alloc, 0 GC
+      process(buf[0])
+  
+  호출자가 1-elt 버퍼를 한 번 만들어서 영구 재사용. ring 코드는 그 버퍼에 memcpy만 한다. GC 호출 0번. 작은 변화지만 hot path에서는 큰 차이.
+  
+  Footgun 4: 관측 불가능
+  
+  원본에는 "지금까지 몇 개 push됐는지" 알 방법이 없었다. ring이 막혔는데 왜 막혔는지, 처리량은 얼마인지, lag이 쌓이는지 — 전부 깜깜이.
+  
+  새 버전은 헤더에 _seq_ptr (monotonic push counter) 추가:
+
+  ring.push_count()    # 누적 push 횟수
+  ring.size()          # 현재 backlog
+  
+  외부에서 polling해서 Grafana나 로그로 보낼 수 있다. Production 시스템은 관측되지 않으면 운영 불가다.
+  
+  ---
+  측정: 얼마나 빨라졌고 얼마나 안전해졌나
+  
+  ┌────────────────────┬──────────────────────────────┬──────────────────────────────┐
+  │        항목        │         원본 ShmRing         │    새 LockfreeSPSCRingCy     │
+  ├────────────────────┼──────────────────────────────┼──────────────────────────────┤
+  │ push 1회 비용      │ ~5,000-10,000 ns             │ ~100-200 ns                  │
+  ├────────────────────┼──────────────────────────────┼──────────────────────────────┤
+  │ pop 1회 비용       │ ~3,000-5,000 ns (alloc 포함) │ ~100 ns (pop_into)           │
+  ├────────────────────┼──────────────────────────────┼──────────────────────────────┤
+  │ Atomic 보장        │ 없음 (운에 의존)             │ x86-64 TSO + volatile로 명시 │
+  ├────────────────────┼──────────────────────────────┼──────────────────────────────┤
+  │ Memory ordering    │ 보장 없음                    │ x86-64 TSO 가정 명시         │
+  ├────────────────────┼──────────────────────────────┼──────────────────────────────┤
+  │ 정렬 보장          │ 우연                         │ 명시적 (offset 0/8/16/24)    │
+  ├────────────────────┼──────────────────────────────┼──────────────────────────────┤
+  │ Cross-restart 생존 │ ❌                           │ ✅                           │
+  ├────────────────────┼──────────────────────────────┼──────────────────────────────┤
+  │ Capacity 검증      │ ❌                           │ ✅                           │
+  ├────────────────────┼──────────────────────────────┼──────────────────────────────┤
+  │ Observability      │ ❌                           │ push_count, size             │
+  └────────────────────┴──────────────────────────────┴──────────────────────────────┘
+
+  push 비용이 30~50배 줄었다. 핫 루프가 초당 10만 push라면 ring buffer만으로 절약된 시간이 초당 0.5~1초. 단지 CPU 부하만이 아니라 그 시간에 다른 일을 할 수 있다는 게 핵심이다.
+  
+  더 중요한 건 안전성이다. 첫 버전이 production에서 어쩌다 한 번 silent하게 잘못 동작했어도 나는 모를 확률이 높았다. 이제는 어떤 환경에서 어떤 조건 하에 안전한지가 코드 docstring에 명시돼 있다. 운에 안 맡긴다.
+  
+  ---
+  진짜 배운 것
+  
+  코드 자체보다 개념적 깨달음들이 컸다.
+
+  1. "lock-free"는 가볍게 쓰면 안 되는 단어다
+  
+  Lock 안 쓴다고 lock-free가 아니다. Lock-free는 (a) atomic primitives, (b) memory ordering, (c) cache-coherent hardware 셋의 조합이 있을 때만 진짜 lock-free다. 셋 중 하나라도 빠지면 그건 그냥 "lock 안 쓰는 안 안전한 코드"다.
+  
+  2. Python interpreter는 메모리 모델을 가리는 두꺼운 막이다
+  
+  Python으로 코드 쓰면 메모리 정렬, atomic, ordering 같은 것들이 안 보인다. 잘 동작하면 "안전한 줄" 안다. 하지만 그 막을 걷어내면 CPU 수준에서는 위태로운 일들이 일어나고 있을 수 있다. C/Cython으로 내려가면 이게 다 명시적으로 보인다. 보이기 시작하면 안
+  보일 때보다 훨씬 안전하게 짤 수 있다.
+
+  3. GIL은 만능 보호막이 아니다
+  
+  같은 프로세스 안 스레드는 GIL이 보호해준다. 하지만 multiprocessing으로 가는 순간 GIL은 다른 프로세스를 모른다. 같은 메모리를 공유해도 보호되지 않는다. 이 사실을 명확히 알고 나면 multi-process 시스템 디자인이 완전히 달라진다.
+  
+  4. Lifecycle은 algorithm만큼 중요하다
+  
+  알고리즘이 멋있어도 SHM이 잘못 unlink되면 시스템은 죽는다. resource_tracker 함정 같은 건 책에 안 나오고 stack overflow에도 잘 없다. 직접 운영하다 한 번 깨져봐야 안다. Production 시스템은 알고리즘 50%, lifecycle/recovery 50%다.
+  
+  5. Hot path는 API 디자인으로 결판난다
+  
+  알고리즘이 빠른 것보다 호출자가 alloc 안 하게 만드는 게 더 큰 영향일 때가 많다. pop_many를 pop_into로 바꾼 게 코드 한 줄 수준이지만 hot path에서는 거대한 차이다. 좋은 API는 "사용자가 잘못 쓰기 어렵게" 만드는 거고, hot path API는 "사용자가 alloc 안
+  하게" 만드는 거다.
+
+  ---
+  마무리
+  
+  이 ring buffer 하나 만드는 데 두 번의 큰 다시쓰기가 있었다. 첫 번째 버전은 "동작하니까 lock-free인 줄 알았던" 버전이고, 두 번째 버전은 "왜 첫 버전이 lock-free가 아닌지 이해한 후의" 버전이다.
+
+  지금 와서 보면 첫 버전의 코드는 부끄럽지 않다. 그게 출발점이었고, 그걸 만들었기에 두 번째 버전을 짤 수 있었다. 다만 "lock-free"라는 단어를 머리에 박은 채 첫 버전을 production에 그대로 뒀으면 어디선가 silent corruption이 났을 거다.
+  
+  마켓메이커 시스템에서 ring buffer는 작은 부품 하나일 뿐이다. 그 위에 strategy, state machine, order management, recovery 같은 큰 덩어리들이 올라간다. 하지만 그 작은 부품 하나에 이 정도의 정밀함이 필요하다. 그게 production HFT-style 시스템을 만든다는
+  것의 의미다.
+
+  원본 코드는 작동했다. 새 코드는 어떤 환경에서 어떤 조건 하에 작동하는지 안다. 이 차이가 무엇보다 중요하다.
